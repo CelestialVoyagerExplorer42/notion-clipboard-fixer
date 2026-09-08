@@ -1,28 +1,32 @@
-name: fix-titles
+name: Fix Notion Clipboard Titles
 
 on:
-  workflow_dispatch: {}
   schedule:
-    - cron: "17,47 * * * *"   # 每小时的 :17 和 :47 (避开整点/半点高峰)
+    - cron: "17,47 * * * *"
+  workflow_dispatch:
 
 jobs:
-  fix:
+  fix-titles:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: 24
           cache: npm
 
-      - run: npm ci
+      - name: Install dependencies
+        run: npm ci
 
-      - name: Run title fixer
+      - name: Fix Notion titles
+        run: npm run fix-titles
         env:
           NOTION_API_TOKEN: ${{ secrets.NOTION_API_TOKEN }}
           NOTION_UNTITLED_VIEW_ID: ${{ secrets.NOTION_UNTITLED_VIEW_ID }}
-        run: npm run fix-titles
 
       - name: Keepalive Workflow
         uses: gautamkrishnar/keepalive-workflow@v2

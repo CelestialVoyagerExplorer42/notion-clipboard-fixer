@@ -1,0 +1,25 @@
+name: fix-titles
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "17,47 * * * *"   # 每小时的 :17 和 :47 (避开整点/半点高峰)
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - run: npm ci
+
+      - name: Run title fixer
+        env:
+          NOTION_API_TOKEN: ${{ secrets.NOTION_API_TOKEN }}
+          NOTION_UNTITLED_VIEW_ID: ${{ secrets.NOTION_UNTITLED_VIEW_ID }}
+        run: npm run fix-titles

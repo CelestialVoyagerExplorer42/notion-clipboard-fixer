@@ -91,6 +91,12 @@ npm run fix-titles
 
 ---
 
+## AI Title 来源
+
+本工具读取的「AI Title」由 Notion 数据库的 AI automation 自动生成,完整的 prompt 及配置说明见 [AI_TITLE_PROMPT.md](AI_TITLE_PROMPT.md)。
+
+---
+
 ## License
 
 MIT

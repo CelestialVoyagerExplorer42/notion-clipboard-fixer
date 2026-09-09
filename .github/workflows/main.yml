@@ -1,4 +1,4 @@
-name: Fix Notion Clipboard Titles
+name: main
 
 on:
   schedule:
@@ -8,28 +8,19 @@ on:
 jobs:
   fix-titles:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Fix Notion titles
+      - run: npm ci
+      - name: Fix titles
         run: npm run fix-titles
         env:
           NOTION_API_TOKEN: ${{ secrets.NOTION_API_TOKEN }}
           NOTION_UNTITLED_VIEW_ID: ${{ secrets.NOTION_UNTITLED_VIEW_ID }}
-
-      - name: Keepalive Workflow
-        uses: gautamkrishnar/keepalive-workflow@v2
+      - uses: gautamkrishnar/keepalive-workflow@v2
         with:
           gh_token: ${{ secrets.GITHUB_TOKEN }}
-          commit_message: "chore: keepalive action to prevent suspension [skip ci]"
+          commit_message: "chore: keepalive [skip ci]"

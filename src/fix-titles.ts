@@ -1,231 +1,330 @@
 /**
  * Notion Clipboard Title Fixer
  *
- * Scans a saved view in the Clipboard database,
- * finds pages with timestamp/empty titles,
- * and replaces their title with the AI Title property value.
+ * 扫描 Clipboard 数据库的 Untitled 视图:
+ * 凡 AI Title 属性已是有效标题的页面, 将页面标题(Name)替换为 AI Title 的值。
  *
- * View Query API: POST /v1/views/{view_id}/queries
- * Cleanup: DELETE /v1/views/{view_id}/queries/{query_id}
+ * 环境变量:
+ *   NOTION_API_TOKEN         — Notion Integration Token (须能访问 Clipboard 库)
+ *   NOTION_UNTITLED_VIEW_ID  — Untitled 视图 ID
  */
 
-import { Client } from "@notionhq/client"
+import { Client } from "@notionhq/client";
 
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
+// ─── Config ────────────────────────────────────────────────────────────────
 
-const NOTION_API_TOKEN = process.env.NOTION_API_TOKEN
-const NOTION_UNTITLED_VIEW_ID = process.env.NOTION_UNTITLED_VIEW_ID
-const PAGE_SIZE = 100
-const CONCURRENCY = 8
+const NOTION_API_TOKEN = process.env.NOTION_API_TOKEN;
+const NOTION_UNTITLED_VIEW_ID = process.env.NOTION_UNTITLED_VIEW_ID;
+const PAGE_SIZE = 100;
+const CONCURRENCY = 8; // 并发度: retrieve + update 的并行上限
+const MAX_RETRIES = 5; // 429 重试上限
 
 if (!NOTION_API_TOKEN) {
-  console.error("❌ NOTION_API_TOKEN is not set")
-  process.exit(1)
+  console.error("❌ Missing NOTION_API_TOKEN");
+  process.exit(1);
 }
 if (!NOTION_UNTITLED_VIEW_ID) {
-  console.error("❌ NOTION_UNTITLED_VIEW_ID is not set")
-  process.exit(1)
+  console.error("❌ Missing NOTION_UNTITLED_VIEW_ID");
+  process.exit(1);
 }
 
-const notion = new Client({ auth: NOTION_API_TOKEN })
+const notion = new Client({ auth: NOTION_API_TOKEN });
+const VIEW_ID: string = NOTION_UNTITLED_VIEW_ID;
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+// ─── Title Helpers ─────────────────────────────────────────────────────────
 
+/** 判断 AI Title 是否是一个「可用的标题」 */
 function isUsableTitle(raw: string | undefined | null): boolean {
-  const t = (raw ?? "").trim()
-  if (!t) return false
-  if (/^no\s*content$/i.test(t)) return false
-  // Timestamp-style default titles: "2026年4月23日 22:49" / "...的链接分享"
-  if (/^\d{4}年\d{1,2}月\d{1,2}日\s+\d{1,2}:\d{2}/.test(t)) return false
-  return true
+  const t = (raw ?? "").trim();
+  if (!t) return false;
+  // Notion AI 未生成出标题时的占位
+  if (/^no\s*content$/i.test(t)) return false;
+  // 剪藏默认时间戳样式: 2026年4月23日 22:49 / 2026年4月23日 22:49 记录 ...
+  if (/^\d{4}年\d{1,2}月\d{1,2}日\s+\d{1,2}:\d{2}/.test(t)) return false;
+  return true;
 }
 
+/** 清理标题里的 markdown 痕迹, 避免标题带语法垃圾 */
 function sanitizeTitle(raw: string): string {
   return (
     raw
-      .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")   // [text](url) -> text
-      .replace(/[*_]{1,3}/g, "")                  // strip bold/italic markers
-      .replace(/\s+/g, " ")                       // collapse whitespace
+      // [text](url) -> text
+      .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+      // 去掉残留的 ** / __ / * / _ 强调符
+      .replace(/[*_]{1,3}/g, "")
+      // 折叠空白与换行
+      .replace(/\s+/g, " ")
       .trim()
-      .slice(0, 300)                              // truncate to 300 chars
-  )
+      // 标题上限保护
+      .slice(0, 300)
+  );
 }
 
-/**
- * Exponential backoff retry for 429 / transient errors.
- */
-async function withRetry<T>(
-  fn: () => Promise<T>,
-  label: string,
-  maxRetries = 3,
-): Promise<T> {
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+// ─── Rate Limit Helpers ────────────────────────────────────────────────────
+
+/** 指数退避重试, 处理 429 Too Many Requests */
+async function withRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      return await fn()
+      return await fn();
     } catch (err: unknown) {
       const status =
         typeof err === "object" && err !== null && "status" in err
           ? (err as { status: number }).status
-          : undefined
-      if (status === 429 || status === 503 || status === 500) {
+          : undefined;
+      if (status === 429 && attempt < MAX_RETRIES) {
+        // Notion API 返回的 Retry-After 或默认退避
         const retryAfter =
           typeof err === "object" && err !== null && "headers" in err
             ? (err as { headers?: Record<string, string> }).headers?.[
                 "retry-after"
               ]
-            : undefined
-        const delay = retryAfter
-          ? Number(retryAfter) * 1000
-          : Math.min(1000 * 2 ** attempt + Math.random() * 500, 30_000)
+            : undefined;
+        const delayMs = retryAfter
+          ? parseInt(retryAfter, 10) * 1000
+          : Math.min(1000 * 2 ** attempt, 30_000); // 最大 30s
         console.warn(
-          `⚠️ ${label}: HTTP ${status} (attempt ${attempt + 1}/${maxRetries + 1}), retrying in ${Math.round(delay)}ms`,
-        )
-        await new Promise((r) => setTimeout(r, delay))
-        continue
+          `⏳ [${label}] 429 rate limit, retry ${attempt + 1}/${MAX_RETRIES} in ${delayMs}ms`
+        );
+        await sleep(delayMs);
+        continue;
       }
-      throw err
+      throw err;
     }
   }
-  throw new Error(`Exhausted retries for ${label}`)
+  throw new Error(`[${label}] Exceeded ${MAX_RETRIES} retries`);
 }
 
-// ---------------------------------------------------------------------------
-// Concurrency-limited executor
-// ---------------------------------------------------------------------------
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
+// ─── Concurrency Pool ──────────────────────────────────────────────────────
+
+/**
+ * 并发限制执行器: 限制同时运行的 Promise 数量,
+ * 避免 750+ 页面全部同时发请求导致 429。
+ */
 async function runWithConcurrency<T>(
-  items: T[],
-  concurrency: number,
-  fn: (item: T, index: number) => Promise<void>,
-): Promise<void> {
-  let idx = 0
-  const next = async () => {
-    while (idx < items.length) {
-      const i = idx++
-      await fn(items[i], i)
+  tasks: Array<() => Promise<T>>,
+  concurrency: number
+): Promise<T[]> {
+  const results: T[] = [];
+  const executing = new Set<Promise<void>>();
+
+  for (const task of tasks) {
+    const p = task()
+      .then((result) => {
+        results.push(result);
+      })
+      .catch((err) => {
+        results.push(err as T); // 错误会在最后统一处理
+      })
+      .finally(() => {
+        executing.delete(p);
+      });
+
+    executing.add(p);
+
+    if (executing.size >= concurrency) {
+      await Promise.race(executing);
     }
   }
-  const workers = Array.from({ length: Math.min(concurrency, items.length) }, () => next())
-  await Promise.all(workers)
+
+  await Promise.all(executing);
+  return results;
 }
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
+// ─── View Query (fetch-based, SDK 可能尚未内置) ────────────────────────────
+
+interface ViewQueryResult {
+  results: Array<{ id: string }>;
+  has_more: boolean;
+  next_cursor: string | null;
+  query_id: string;
+}
+
+interface ViewQueryResponse {
+  results: Array<{ id: string }>;
+  has_more: boolean;
+  next_cursor: string | null;
+}
+
+/** 创建 View Query (POST /v1/views/{view_id}/queries) */
+async function createViewQuery(
+  viewId: string
+): Promise<ViewQueryResult> {
+  return withRetry(async () => {
+    const res = await fetch(
+      `https://api.notion.com/v1/views/${viewId}/queries`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${NOTION_API_TOKEN}`,
+          "Notion-Version": "2022-06-28",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ page_size: PAGE_SIZE }),
+      }
+    );
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`View query create failed (${res.status}): ${body}`);
+    }
+    return res.json() as Promise<ViewQueryResult>;
+  }, "createViewQuery");
+}
+
+/** 获取下一页 (GET /v1/views/{view_id}/queries/{query_id}/results) */
+async function getViewQueryResults(
+  viewId: string,
+  queryId: string,
+  startCursor?: string
+): Promise<ViewQueryResponse> {
+  const params = new URLSearchParams({ page_size: String(PAGE_SIZE) });
+  if (startCursor) params.set("start_cursor", startCursor);
+
+  return withRetry(async () => {
+    const res = await fetch(
+      `https://api.notion.com/v1/views/${viewId}/queries/${queryId}/results?${params}`,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${NOTION_API_TOKEN}`,
+          "Notion-Version": "2022-06-28",
+        },
+      }
+    );
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`View query results failed (${res.status}): ${body}`);
+    }
+    return res.json() as Promise<ViewQueryResponse>;
+  }, "getViewQueryResults");
+}
+
+// ─── Summary Type ──────────────────────────────────────────────────────────
 
 interface Summary {
-  totalInView: number
-  updated: Array<{ id: string; from: string; to: string }>
-  skippedNoTitle: number
-  skippedUnusable: number
-  skippedSameName: number
-  errors: Array<{ id: string; error: string }>
+  totalInView: number;
+  updated: number;
+  skippedNoTitle: number;
+  skippedUnusable: number;
+  skippedSameName: number;
+  errors: number;
+  details: Array<{ id: string; from: string; to: string } | { id: string; error: string }>;
 }
 
-async function main(): Promise<void> {
+// ─── Main ──────────────────────────────────────────────────────────────────
+
+async function main() {
   const summary: Summary = {
     totalInView: 0,
-    updated: [],
+    updated: 0,
     skippedNoTitle: 0,
     skippedUnusable: 0,
     skippedSameName: 0,
-    errors: [],
-  }
+    errors: 0,
+    details: [],
+  };
 
-  // --- 1. View Query: fetch all page ids in the "Untitled" view ---
-  const pageIds: string[] = []
+  console.log(`🚀 Starting title fix — view: ${VIEW_ID}`);
 
-  const first = await withRetry(
-    () =>
-      notion.views.queries.create({
-        view_id: NOTION_UNTITLED_VIEW_ID!,
-        page_size: PAGE_SIZE,
-      }),
-    "views.queries.create",
-  )
-  pageIds.push(...first.results.map((p) => p.id))
-  let cursor = first.next_cursor
+  // ── Step 1: View Query 分页拉取所有页面 ID ──
+  const pageIds: string[] = [];
+  let queryId: string | undefined;
+
+  const first = await createViewQuery(VIEW_ID);
+  queryId = first.query_id;
+  pageIds.push(...first.results.map((p) => p.id));
+  console.log(`📄 Page 1: ${first.results.length} pages (total so far: ${pageIds.length})`);
+
+  let cursor = first.next_cursor;
   while (first.has_more && cursor) {
-    const next = await withRetry(
-      () =>
-        notion.views.queries.results({
-          view_id: NOTION_UNTITLED_VIEW_ID!,
-          query_id: first.id,
-          start_cursor: cursor!,
-          page_size: PAGE_SIZE,
-        }),
-      "views.queries.results",
-    )
-    pageIds.push(...next.results.map((p) => p.id))
-    cursor = next.next_cursor ?? null
-    if (!next.has_more) break
-  }
-  summary.totalInView = pageIds.length
-
-  // --- 2. Cleanup: delete the query to avoid Notion-side cache bloat ---
-  try {
-    await withRetry(
-      () =>
-        notion.views.queries.delete({
-          view_id: NOTION_UNTITLED_VIEW_ID!,
-          query_id: first.id,
-        }),
-      "views.queries.delete",
-    )
-  } catch {
-    // Best-effort; log but don't fail the run
-    console.warn("⚠️ Could not clean up view query (non-fatal)")
+    const next = await getViewQueryResults(
+      VIEW_ID,
+      queryId,
+      cursor
+    );
+    pageIds.push(...next.results.map((p) => p.id));
+    console.log(`📄 Next page: +${next.results.length} (total: ${pageIds.length})`);
+    cursor = next.next_cursor;
+    if (!next.has_more) break;
   }
 
-  console.log(`🔍 Found ${pageIds.length} pages in Untitled view`)
+  summary.totalInView = pageIds.length;
+  console.log(`📊 Total pages in Untitled view: ${pageIds.length}`);
 
-  // --- 3. Process each page (with concurrency limit) ---
-  await runWithConcurrency(pageIds, CONCURRENCY, async (pageId) => {
+  // ── Step 2: 清理 Query (释放 Notion 端缓存) ──
+  if (queryId) {
     try {
-      // Retrieve page properties
-      const page = await withRetry(
-        () => notion.pages.retrieve({ page_id: pageId }),
-        `pages.retrieve(${pageId.slice(0, 8)})`,
-      )
-      const props = (page as { properties?: Record<string, unknown> }).properties ?? {}
+      await fetch(
+        `https://api.notion.com/v1/views/${VIEW_ID}/queries/${queryId}`,
+        {
+          method: "DELETE",
+          headers: {
+            Authorization: `Bearer ${NOTION_API_TOKEN}`,
+            "Notion-Version": "2022-06-28",
+          },
+        }
+      );
+      console.log("🧹 Query cleaned up");
+    } catch {
+      // DELETE 查询端点可能不存在或无权限, 非致命
+      console.log("⚠️  Query cleanup skipped (non-fatal)");
+    }
+  }
 
-      // Read current title (Name)
+  if (pageIds.length === 0) {
+    console.log("✅ No pages in Untitled view — nothing to do.");
+    console.log(JSON.stringify(summary, null, 2));
+    return;
+  }
+
+  // ── Step 3: 并发处理每个页面 ──
+  const tasks = pageIds.map((pageId) => async () => {
+    try {
+      // retrieve
+      const page = await withRetry(
+        () =>
+          notion.pages.retrieve({ page_id: pageId }) as Promise<{
+            id: string;
+            properties: Record<string, unknown>;
+          }>,
+        `retrieve:${pageId.slice(0, 8)}`
+      );
+
+      const props = page.properties ?? {};
+
+      // 读当前标题(Name)
       const nameProp = props["Name"] as
         | { type: "title"; title: Array<{ plain_text: string }> }
-        | undefined
-      const currentName = (nameProp?.title ?? []).map((t) => t.plain_text).join("")
+        | undefined;
+      const currentName = (nameProp?.title ?? []).map((t) => t.plain_text).join("");
 
-      // Read AI Title property
+      // 读 AI Title 属性
       const aiProp = props["AI Title"] as
         | { type: "rich_text"; rich_text?: Array<{ plain_text: string }> }
-        | undefined
-      const aiTitle = (aiProp?.rich_text ?? []).map((t) => t.plain_text).join("")
+        | undefined;
+      const aiRich = aiProp?.rich_text ?? [];
+      const aiTitle = aiRich.map((t) => t.plain_text).join("");
 
-      // Skip: no AI Title at all
       if (!aiTitle.trim()) {
-        summary.skippedNoTitle++
-        return
+        summary.skippedNoTitle++;
+        return { type: "skip" as const, reason: "noTitle" };
       }
-
-      // Skip: AI Title is unusable
       if (!isUsableTitle(aiTitle)) {
-        summary.skippedUnusable++
-        return
+        summary.skippedUnusable++;
+        return { type: "skip" as const, reason: "unusable" };
       }
 
-      const newName = sanitizeTitle(aiTitle)
-
-      // Skip: nothing to change
+      const newName = sanitizeTitle(aiTitle);
       if (!newName || newName === currentName) {
-        summary.skippedSameName++
-        return
+        summary.skippedSameName++;
+        return { type: "skip" as const, reason: "sameName" };
       }
 
-      // Update page title
+      // update
       await withRetry(
         () =>
           notion.pages.update({
@@ -234,25 +333,30 @@ async function main(): Promise<void> {
               Name: { title: [{ text: { content: newName } }] },
             },
           }),
-        `pages.update(${pageId.slice(0, 8)})`,
-      )
+        `update:${pageId.slice(0, 8)}`
+      );
 
-      summary.updated.push({ id: pageId, from: currentName, to: newName })
-      console.log(`  ✅ ${currentName} → ${newName}`)
+      summary.updated++;
+      summary.details.push({ id: pageId, from: currentName, to: newName });
+      return { type: "updated" as const, id: pageId };
     } catch (err) {
-      summary.errors.push({
-        id: pageId,
-        error: err instanceof Error ? err.message : String(err),
-      })
+      summary.errors++;
+      const msg = err instanceof Error ? err.message : String(err);
+      summary.details.push({ id: pageId, error: msg });
+      return { type: "error" as const, id: pageId, error: msg };
     }
-  })
+  });
 
-  // --- 4. Output summary ---
-  console.log("\n📊 Summary:")
-  console.log(JSON.stringify(summary, null, 2))
+  await runWithConcurrency(tasks, CONCURRENCY);
+
+  // ── Step 4: 输出统计 ──
+  console.log("\n═══════════════════════════════════════");
+  console.log("📊 Summary");
+  console.log("═══════════════════════════════════════");
+  console.log(JSON.stringify(summary, null, 2));
 }
 
 main().catch((err) => {
-  console.error("❌ Fatal error:", err)
-  process.exit(1)
-})
+  console.error("❌ Fatal error:", err);
+  process.exit(1);
+});

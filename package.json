@@ -8,14 +8,11 @@
     "check": "tsc --noEmit"
   },
   "dependencies": {
-    "@notionhq/client": "^5.26.0"
+    "@notionhq/client": "^2.2.15"
   },
   "devDependencies": {
-    "@types/node": "^24.0.0",
-    "tsx": "^4.20.0",
+    "@types/node": "^22.9.0",
+    "tsx": "^4.20.6",
     "typescript": "^5.8.0"
-  },
-  "engines": {
-    "node": ">=24.0.0"
   }
 }
